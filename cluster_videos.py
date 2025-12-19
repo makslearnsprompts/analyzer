@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from datetime import datetime
 from typing import List, Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Import everything we need from compare_two_videos.py
 # (Ensure compare_two_videos.py is in the same directory)
@@ -18,7 +19,6 @@ try:
     from compare_two_videos import (
         init_gemini, 
         compare_videos, 
-        load_prompt_v2, 
         get_videos_in_folder,
         BASE_DIR
     )
@@ -45,7 +45,21 @@ class Cluster:
         }
 
 
-def perform_clustering(folder_name: str, output_file: Optional[str] = None):
+def prune_none(obj):
+    """Recursively remove keys with None values from dicts/lists."""
+    if isinstance(obj, dict):
+        out = {}
+        for k, v in obj.items():
+            if v is None:
+                continue
+            out[k] = prune_none(v)
+        return out
+    if isinstance(obj, list):
+        return [prune_none(v) for v in obj]
+    return obj
+
+
+def perform_clustering(folder_name: str, output_file: Optional[str] = None, max_workers: int = 4):
     folder = BASE_DIR / folder_name
     if not folder.exists():
         print(f"❌ Folder not found: {folder_name}")
@@ -56,53 +70,56 @@ def perform_clustering(folder_name: str, output_file: Optional[str] = None):
         print(f"❌ No videos found in {folder_name}")
         return
 
+    start_time = time.time()
     print(f"🚀 Starting incremental clustering for '{folder_name}' ({len(videos)} videos)")
     print("=" * 60)
 
     init_gemini()
-    prompt = load_prompt_v2()
 
     clusters: List[Cluster] = []
     comparisons_made = []
+    remaining = videos.copy()
+    cluster_id = 1
 
-    for i, video in enumerate(videos):
-        print(f"\n🎥 Processing video {i+1}/{len(videos)}: {video.name}")
-        
-        # If no clusters exist, create the first one
-        if not clusters:
-            print(f"   ✨ No clusters yet. Creating Cluster 1.")
-            clusters.append(Cluster(1, video))
-            continue
-            
-        # Try to match with existing clusters
-        matched = False
-        for cluster in clusters:
-            print(f"   🔍 Comparing with Cluster {cluster.id} (Rep: {cluster.representative.name})...")
-            
-            # Compare current video with cluster representative
-            result = compare_videos(cluster.representative, video, prompt)
-            
-            # Store comparison result for debugging/audit
-            comparisons_made.append({
-                "video_1": cluster.representative.name,
-                "video_2": video.name,
-                "same_group": result.get("same_group"),
-                "differences": result.get("differences", [])
-            })
-            
-            if result.get("same_group") is True:
-                print(f"   ✅ MATCH! Added to Cluster {cluster.id}")
-                cluster.add_video(video)
-                matched = True
-                break # Greedy match: stop after finding first match
-            else:
-                print(f"   ❌ Different from Cluster {cluster.id}")
-        
-        # If no match found after checking all clusters, create a new one
-        if not matched:
-            new_id = len(clusters) + 1
-            print(f"   ✨ No match found. Creating Cluster {new_id}.")
-            clusters.append(Cluster(new_id, video))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        while remaining:
+            representative = remaining.pop(0)
+            print(f"\n🎥 New cluster seed: {representative.name}")
+            current_cluster = Cluster(cluster_id, representative)
+            cluster_id += 1
+
+            if not remaining:
+                clusters.append(current_cluster)
+                break
+
+            candidates = remaining
+            remaining = []
+
+            futures = {executor.submit(compare_videos, representative, candidate): candidate for candidate in candidates}
+
+            for future in as_completed(futures):
+                candidate = futures[future]
+                try:
+                    result = future.result()
+                except Exception as e:
+                    logging.error("Comparison failed for %s vs %s: %s", representative.name, candidate.name, e)
+                    result = {"same_group": None, "differences": [], "error": str(e)}
+
+                comparisons_made.append({
+                    "video_1": representative.name,
+                    "video_2": candidate.name,
+                    "same_group": result.get("same_group"),
+                    "differences": result.get("differences", []),
+                    "error": result.get("error")
+                })
+
+                if result.get("same_group") is True:
+                    print(f"   ✅ {candidate.name} matches cluster {current_cluster.id}")
+                    current_cluster.add_video(candidate)
+                else:
+                    remaining.append(candidate)
+
+            clusters.append(current_cluster)
 
     # --- Summary & Output ---
     print("\n" + "="*60)
@@ -119,11 +136,13 @@ def perform_clustering(folder_name: str, output_file: Optional[str] = None):
     output_data = {
         "folder": folder_name,
         "timestamp": datetime.now().isoformat(),
+        "pipeline_seconds": round(time.time() - start_time, 3),
         "total_videos": len(videos),
         "total_clusters": len(clusters),
         "clusters": [c.to_dict() for c in clusters],
         "comparisons_history": comparisons_made
     }
+    output_data = prune_none(output_data)
 
     if not output_file:
         output_file = f"{folder_name}_clustering_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
@@ -131,15 +150,17 @@ def perform_clustering(folder_name: str, output_file: Optional[str] = None):
     with open(output_file, 'w') as f:
         json.dump(output_data, f, indent=2)
     print(f"\n💾 Results saved to: {output_file}")
+    logging.info("Clustering finished in %.2f seconds", time.time() - start_time)
 
 
 def main():
     parser = argparse.ArgumentParser(description="Incremental Clustering for A/B Test Videos")
     parser.add_argument("--folder", "-f", required=True, help="Folder containing videos")
     parser.add_argument("--output", "-o", help="Output JSON file")
+    parser.add_argument("--max-workers", type=int, default=4, help="Parallel comparisons worker count")
     
     args = parser.parse_args()
-    perform_clustering(args.folder, args.output)
+    perform_clustering(args.folder, args.output, args.max_workers)
 
 
 if __name__ == "__main__":
