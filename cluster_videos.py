@@ -20,7 +20,9 @@ try:
         init_gemini, 
         compare_videos, 
         get_videos_in_folder,
-        BASE_DIR
+        BASE_DIR,
+        DEFAULT_ANALYSIS_FPS,
+        DEFAULT_FOCUSED_JUDGE_FPS
     )
 except ImportError:
     print("❌ Error: compare_two_videos.py not found or not importable.")
@@ -59,7 +61,7 @@ def prune_none(obj):
     return obj
 
 
-def perform_clustering(folder_name: str, output_file: Optional[str] = None, max_workers: int = 4):
+def perform_clustering(folder_name: str, output_file: Optional[str] = None, max_workers: int = 4, fps: int = DEFAULT_ANALYSIS_FPS, judge_random_trimming: bool = True, judge_focused_trim: bool = True, judge_focused_fps: int = DEFAULT_FOCUSED_JUDGE_FPS, side_by_side: bool = True):
     folder = BASE_DIR / folder_name
     if not folder.exists():
         print(f"❌ Folder not found: {folder_name}")
@@ -71,7 +73,7 @@ def perform_clustering(folder_name: str, output_file: Optional[str] = None, max_
         return
 
     start_time = time.time()
-    print(f"🚀 Starting incremental clustering for '{folder_name}' ({len(videos)} videos)")
+    print(f"🚀 Starting incremental clustering for '{folder_name}' ({len(videos)} videos) (FPS={fps}, JudgeTrim={judge_random_trimming}, FocusTrim={judge_focused_trim}, SBS={side_by_side})")
     print("=" * 60)
 
     init_gemini()
@@ -95,7 +97,7 @@ def perform_clustering(folder_name: str, output_file: Optional[str] = None, max_
             candidates = remaining
             remaining = []
 
-            futures = {executor.submit(compare_videos, representative, candidate): candidate for candidate in candidates}
+            futures = {executor.submit(compare_videos, representative, candidate, fps=fps, judge_random_trimming=judge_random_trimming, judge_focused_trim=judge_focused_trim, judge_focused_fps=judge_focused_fps, side_by_side=side_by_side): candidate for candidate in candidates}
 
             for future in as_completed(futures):
                 candidate = futures[future]
@@ -110,6 +112,7 @@ def perform_clustering(folder_name: str, output_file: Optional[str] = None, max_
                     "video_2": candidate.name,
                     "same_group": result.get("same_group"),
                     "differences": result.get("differences", []),
+                    "judge_logs": result.get("judge_logs"),
                     "error": result.get("error")
                 })
 
@@ -139,6 +142,10 @@ def perform_clustering(folder_name: str, output_file: Optional[str] = None, max_
         "pipeline_seconds": round(time.time() - start_time, 3),
         "total_videos": len(videos),
         "total_clusters": len(clusters),
+        "judge_random_trimming": judge_random_trimming,
+        "judge_focused_trim": judge_focused_trim,
+        "judge_focused_fps": judge_focused_fps,
+        "judge_side_by_side": side_by_side,
         "clusters": [c.to_dict() for c in clusters],
         "comparisons_history": comparisons_made
     }
@@ -158,9 +165,14 @@ def main():
     parser.add_argument("--folder", "-f", required=True, help="Folder containing videos")
     parser.add_argument("--output", "-o", help="Output JSON file")
     parser.add_argument("--max-workers", type=int, default=4, help="Parallel comparisons worker count")
+    parser.add_argument("--fps", type=int, default=DEFAULT_ANALYSIS_FPS, help="Frames per second for analysis")
+    parser.add_argument("--no-judge-trim", action="store_false", dest="judge_trim", default=True, help="Disable random trimming for judge verification")
+    parser.add_argument("--no-focused-trim", action="store_false", dest="focused_trim", default=True, help="Disable focused trimming for single difference")
+    parser.add_argument("--focused-fps", type=int, default=DEFAULT_FOCUSED_JUDGE_FPS, help="FPS for focused judge analysis")
+    parser.add_argument("--no-side-by-side", action="store_false", dest="side_by_side", default=True, help="Disable side-by-side video for focused judge")
     
     args = parser.parse_args()
-    perform_clustering(args.folder, args.output, args.max_workers)
+    perform_clustering(args.folder, args.output, args.max_workers, fps=args.fps, judge_random_trimming=args.judge_trim, judge_focused_trim=args.focused_trim, judge_focused_fps=args.focused_fps, side_by_side=args.side_by_side)
 
 
 if __name__ == "__main__":

@@ -5,3 +5,10 @@ __pycache__/
 .venv/
 env/
 *_clustering_*.json
+Cleaner/
+Notee/
+ReRoom/
+ScanGuru/
+Visify/
+.upload_cache.sqlite3
+.upload_cache_locks/

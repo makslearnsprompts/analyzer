@@ -31,7 +31,7 @@ Your main goal:
    * For animations: Ask yourself, "Is this the same asset playing at a different time?" If yes → **IGNORE**. Only report if the asset itself is fundamentally different (e.g., a broom animation vs. a vacuum cleaner animation).
 
 6. Text requirement:
-   For each reported difference add a short, clear **human-readable description** (1–2 concise sentences) that states **what changed** and **where**.
+   For each reported difference add a short, clear **human-readable description** (1–2 concise sentences) that states **what changed** and **where** with exact seconds of the video (in video 1 and video 2).
    * For **MODIFY/REPLACE**, include `before → after` when visible (e.g., OCR text/price).
    * Keep descriptions neutral and standardized.
 
@@ -45,6 +45,7 @@ Always respond strictly in JSON with the following structure:
 "differences": [
 {
 "change_type": "ADD" | "REMOVE" | "MODIFY" | "REORDER" | "REPLACE",
+"timestamp": "start_time_in_video_1 -> end_time_in_video_1 | start_time_in_video_2 -> end_time_in_video_2",
 "description": "short human-readable summary",
 "before": "<string>",         // optional
 "after": "<string>"           // optional
@@ -61,72 +62,6 @@ Rules:
 <MAIN TASK>
 Compare the two onboarding videos, detect if they are in the same A/B test group (based only on the five allowed change types), and output the result in JSON.
 </MAIN TASK>
-
-<REFERENCE_PROMPT_V2>
-<INSTRUCTION>
-You are analyzing **two silent screen recordings** of the onboarding process of the same iOS application.
-Each video was recorded by a different agent while going through the onboarding flow.
-
-Your main goal:
-
-1. Decide whether the two videos belong to the **same A/B test group** or to **different groups**.
-
-2. Compare them screen-by-screen and capture only **meaningful differences** that fit exactly one of the following change types (STRICT ENUM):
-
-   * **ADD** — an element/step/screen was added.
-   * **REMOVE** — an element/step/screen was removed.
-   * **MODIFY** — an attribute changed (copy/text, color, size, CTA text, price, trial_days, order of bullets, etc.).
-   * **REORDER** — the order of elements/steps changed.
-   * **REPLACE** — one element was replaced by another (e.g., icon → image).
-
-3. **Ignore everything else** (do NOT treat as A/B):
-   timing/animation speed (very important!!! There there is difference in timing of animations, it means problem on the side of video), skeleton loaders, network delays, device/screen-size responsive reflow without role change, status bar (battery/wifi/time), notifications, cursor movement, OS visual style differences, user choosing a different path when the same options are visible in both versions.
-
-4. Decision rule:
-
-   * If you detect **at least one** difference of the allowed types above → `"same_group": false`.
-   * If you detect **none** of the allowed types → `"same_group": true`.
-
-5. The bot agents may navigate differently (delays, pressing different visible options). Be careful to distinguish user choice from real A/B differences. Only report differences that clearly fit the allowed types.
-
-6. Text requirement:
-   For each reported difference add a short, clear **human-readable description** (1–2 concise sentences) that states **what changed** and **where** (e.g., screen or element).
-
-   * For **MODIFY/REPLACE**, include `before → after` when visible (e.g., OCR text/price).
-   * Keep descriptions neutral and standardized (no speculation).
-
-</INSTRUCTION>
-
-<OUTPUT FORMAT>
-Always respond strictly in JSON with the following structure:
-
-{
-"same_group": true | false,
-"differences": [
-{
-"change_type": "ADD" | "REMOVE" | "MODIFY" | "REORDER" | "REPLACE",
-"description": "short human-readable summary of what changed and where",
-"before": "<string>",         // optional: previous value/text/asset for MODIFY/REPLACE
-"after": "<string>"           // optional: new value/text/asset for MODIFY/REPLACE
-}
-]
-}
-
-Rules:
-
-* Include `"differences"` only for the five allowed change types.
-* Omit optional fields if not applicable or unknown.
-* If no allowed differences are found, return `"differences": []` and `"same_group": true`.
-
-</OUTPUT FORMAT>
-
-<MAIN TASK>
-Compare the two onboarding videos, detect if they are in the same A/B test group (based only on the five allowed change types), and output the result in JSON.
-
-<MOTIVATION>
-Your accuracy is critical for detecting A/B tests. Be precise, exhaustive within the five types, and avoid assumptions outside of them.
-</MOTIVATION>
-</REFERENCE_PROMPT_V2>
 """
 
 
@@ -155,6 +90,81 @@ JUDGE_PROMPT_TEMPLATE = """
    {
    "reasoning": "Explanation and your thought process about the differences",
    "verified": true | false,
+   }
+</OUTPUT>
+"""
+
+JUDGE_FOCUSED_PROMPT_TEMPLATE = """
+<ROLE>
+   You are an expert Video Quality Assurance Judge.
+   Your ONLY task is to verify if the reported difference between two videos is REAL or a HALLUCINATION.
+</ROLE>
+
+<CONTEXT>
+   You are viewing SHORT CLIPS extracted specifically around the timestamp where a difference was reported.
+   These clips include a few seconds of buffer before and after the reported event.
+   
+   NOTE: The timing in these clips is relative to the clip start, NOT the original video. 
+   You must look for the SPECIFIC content difference described, regardless of exact second it appears in this clip.
+</CONTEXT>
+
+<INPUT>
+   Here is the claimed difference found by a previous analysis:
+   {differences}
+</INPUT>
+
+<TASK>
+   1. Watch the two attached short clips carefully.
+   2. Check SPECIFICALLY for the difference described above.
+   3. Determine if this difference actually exists in the footage provided.
+      - Ignore start/end cutoffs (these are trimmed clips).
+      - Focus on CONTENT: Is the described element/text/step present in one and absent/different in the other?
+</TASK>
+
+<OUTPUT>
+   Reply strictly with JSON:
+   {
+   "reasoning": "Detailed explanation of what you see in the clips relative to the claimed difference",
+   "verified": true | false
+   }
+</OUTPUT>
+"""
+
+JUDGE_SIDE_BY_SIDE_PROMPT_TEMPLATE = """
+<ROLE>
+   You are an expert Video Quality Assurance Judge.
+   Your ONLY task is to verify if the reported difference is REAL or a HALLUCINATION.
+</ROLE>
+
+<CONTEXT>
+   You are viewing a SINGLE VIDEO containing two clips stacked side-by-side.
+   - LEFT SIDE: Video 1 (Original/First)
+   - RIGHT SIDE: Video 2 (Second)
+   
+   These clips are extracted around the reported timestamp.
+   IGNORE TIMING differences completely. Focus ONLY on the actual content difference.
+</CONTEXT>
+
+<INPUT>
+   Here is the claimed difference found by a previous analysis:
+   {differences}
+</INPUT>
+
+<TASK>
+   1. Watch the side-by-side video carefully.
+   2. Compare the LEFT side vs the RIGHT side.
+   3. Check SPECIFICALLY for the difference described above.
+   4. Determine if this difference actually exists in the content.
+      - Ignore different start/end cutoffs.
+      - Ignore animation sync (unless the difference IS the animation type).
+      - Focus on CONTENT: visual elements, text, layout, flow.
+</TASK>
+
+<OUTPUT>
+   Reply strictly with JSON:
+   {
+   "reasoning": "Detailed explanation of what you see comparing Left vs Right",
+   "verified": true | false
    }
 </OUTPUT>
 """
