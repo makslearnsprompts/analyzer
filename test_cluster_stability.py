@@ -7,6 +7,7 @@ import argparse
 import subprocess
 import sys
 import re
+import time
 
 def parse_clusters_from_output(output):
     """
@@ -76,7 +77,13 @@ def main():
             print(f"Run {i}: EXCEPTION")
             print(f"Error: {str(e)}")
             print("\n")
+        
+        # Wait 1 minute between runs (except after the last run)
+        if i < args.runs:
+            print(f"⏳ Waiting 60 seconds before next run...", file=sys.stderr)
+            time.sleep(60)
 
 if __name__ == "__main__":
     main()
+
 

@@ -24,7 +24,7 @@ from datetime import datetime
 from typing import List
 from dotenv import load_dotenv
 
-from prompts import COMPARISON_PROMPT, JUDGE_PROMPT_TEMPLATE, JUDGE_FOCUSED_PROMPT_TEMPLATE, JUDGE_SIDE_BY_SIDE_PROMPT_TEMPLATE
+from prompts import COMPARISON_PROMPT, JUDGE_PROMPT_TEMPLATE, JUDGE_FOCUSED_PROMPT_TEMPLATE, JUDGE_SIDE_BY_SIDE_PROMPT_TEMPLATE, AB_TEST_CLASSIFIER_PROMPT
 
 # New SDK imports
 from google import genai
@@ -46,9 +46,12 @@ MAX_CONCURRENT_MODEL_CALLS = int(os.getenv("MAX_CONCURRENT_MODEL_CALLS", "4"))
 _MODEL_CALL_SEM = threading.Semaphore(MAX_CONCURRENT_MODEL_CALLS)
 
 # Default FPS settings
-DEFAULT_ANALYSIS_FPS = 3
+DEFAULT_ANALYSIS_FPS = 1
 DEFAULT_JUDGE_FPS = 3
 DEFAULT_FOCUSED_JUDGE_FPS = 5
+
+DEFAULT_MODEL = "gemini-2.5-flash"
+DEFAULT_JUDGE_MODEL = "gemini-2.5-flash"
 
 # Persistent upload cache (local) to avoid expensive remote listing.
 UPLOAD_CACHE_DB = BASE_DIR / ".upload_cache.sqlite3"
@@ -322,6 +325,40 @@ DOUBLE_CHECK_ENABLED = True
 JUDGE_RANDOM_TRIMMING_DEFAULT = False
 JUDGE_FOCUSED_TRIM_DEFAULT = True
 JUDGE_SIDE_BY_SIDE_DEFAULT = True
+SAVE_SBS_FRAMES_DEFAULT = False
+
+# Retry configuration for 429 errors
+MAX_RETRIES = 3
+DEFAULT_RETRY_DELAY = 60  # Default delay if we can't parse from error
+
+
+def parse_retry_delay(error_message: str) -> int:
+    """
+    Parse retry delay from Gemini 429 error message.
+    Example: "Please retry in 38.084595552s" → 39 (rounded up)
+    Returns DEFAULT_RETRY_DELAY if parsing fails.
+    """
+    try:
+        # Look for patterns like "retry in 38.084595552s" or "retryDelay': '38s'"
+        import re
+        patterns = [
+            r'retry in (\d+(?:\.\d+)?)s',
+            r'retryDelay["\']?\s*[:=]\s*["\']?(\d+)s?',
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, str(error_message), re.IGNORECASE)
+            if match:
+                delay = float(match.group(1))
+                return int(delay) + 2  # Add 2 seconds buffer
+        return DEFAULT_RETRY_DELAY
+    except Exception:
+        return DEFAULT_RETRY_DELAY
+
+
+def is_rate_limit_error(error: Exception) -> bool:
+    """Check if an exception is a 429 rate limit error."""
+    error_str = str(error)
+    return "429" in error_str or "RESOURCE_EXHAUSTED" in error_str or "rate" in error_str.lower()
 
 def parse_timestamp(time_str: str) -> float:
     """Parse 'MM:SS' or 'SS' string to seconds."""
@@ -470,7 +507,115 @@ def create_side_by_side_video(video1_path: Path, video2_path: Path) -> Path:
         logging.warning(f"Failed to create side-by-side video. Error: {error_msg}")
         return None
 
-def verify_differences(video1_path: Path, video2_path: Path, differences: list, fps: int = DEFAULT_JUDGE_FPS, random_trimming: bool = True, focused_trim: bool = JUDGE_FOCUSED_TRIM_DEFAULT, focused_fps: int = DEFAULT_FOCUSED_JUDGE_FPS, side_by_side: bool = JUDGE_SIDE_BY_SIDE_DEFAULT) -> tuple[bool, dict]:
+def extract_frames_from_video(video_path: Path, output_dir: Path, fps: int = 1):
+    """Extract frames from video at specified FPS."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", str(video_path),
+        "-vf", f"fps={fps}",
+        str(output_dir / "frame_%04d.jpg")
+    ]
+    try:
+        subprocess.run(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    except subprocess.CalledProcessError as e:
+        logging.warning(f"Failed to extract frames: {e}")
+
+
+def classify_ab_test(differences: list, judge_reasoning: str, model_name: str = DEFAULT_JUDGE_MODEL) -> dict:
+    """
+    Stage 2: Determine if confirmed differences represent an actual A/B test.
+    Called only after the Judge has verified that differences are real.
+    
+    Returns dict with: is_ab_test (bool), reasoning (str), raw_response (dict)
+    """
+    import traceback
+    
+    print(f"\n   🔬 A/B Test Classifier analyzing confirmed differences...")
+    print(f"   📋 Using model: {model_name}")
+    
+    try:
+        differences_str = json.dumps(differences, indent=2)
+        # Use replace instead of format to avoid issues with curly braces in the content
+        prompt = AB_TEST_CLASSIFIER_PROMPT.replace("{differences}", differences_str).replace("{judge_reasoning}", judge_reasoning)
+        print(f"   📝 Prompt prepared ({len(prompt)} chars)")
+    except Exception as e:
+        print(f"   ❌ Failed to prepare prompt: {e}")
+        return {"is_ab_test": True, "reasoning": f"Prompt prep failed: {e}", "error": str(e)}
+    
+    last_error = None
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            print(f"   📤 Sending to Gemini A/B Classifier...")
+            client = get_client()
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[prompt],
+                config=types.GenerateContentConfig(
+                    temperature=0.0,
+                    response_mime_type="application/json"
+                )
+            )
+            print(f"   📥 Response received from Gemini")
+            
+            raw_text = response.text
+            print(f"   📥 Raw text extracted ({len(raw_text)} chars)")
+            
+            # Try to parse JSON, with cleanup if needed
+            try:
+                result = json.loads(raw_text)
+                print(f"   ✅ JSON parsed successfully")
+            except json.JSONDecodeError as je:
+                print(f"   ⚠️ JSON parse failed: {je}")
+                print(f"   🔧 Attempting regex extraction...")
+                json_match = re.search(r'\{[\s\S]*\}', raw_text)
+                if json_match:
+                    extracted = json_match.group()
+                    result = json.loads(extracted)
+                    print(f"   ✅ Regex extraction successful")
+                else:
+                    print(f"   ❌ Regex extraction failed, raw: {raw_text}")
+                    return {"is_ab_test": True, "reasoning": f"JSON parse failed: {raw_text[:200]}", "error": str(je)}
+            
+            is_ab_test = result.get("is_ab_test", True)
+            reasoning = result.get("reasoning", "")
+            decision_path = result.get("decision_path", "")
+            
+            verdict = "✅ A/B TEST" if is_ab_test else "❌ NOT A/B TEST"
+            print(f"   🔬 Classification: {verdict}")
+            if decision_path:
+                print(f"   🌲 Decision Path: {decision_path}")
+            print(f"   📝 Reason: {reasoning}")
+            
+            return {
+                "is_ab_test": is_ab_test,
+                "reasoning": reasoning,
+                "decision_path": decision_path,
+                "raw_response": result
+            }
+            
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+            
+            # Check if this is a rate limit error and we have retries left
+            if is_rate_limit_error(e) and attempt < MAX_RETRIES - 1:
+                retry_delay = parse_retry_delay(error_str)
+                print(f"   ⏳ A/B Classifier rate limited (429). Waiting {retry_delay}s before retry {attempt + 2}/{MAX_RETRIES}...")
+                time.sleep(retry_delay)
+                continue
+            else:
+                # Non-retryable error or max retries exceeded
+                print(f"   ❌ Gemini API call failed: {type(e).__name__}: {e}")
+                print(f"   📜 {traceback.format_exc()}")
+                break
+    
+    # All retries failed
+    return {"is_ab_test": True, "reasoning": f"API call failed after {MAX_RETRIES} retries: {last_error}", "error": str(last_error)}
+
+
+def verify_differences(video1_path: Path, video2_path: Path, differences: list, fps: int = DEFAULT_JUDGE_FPS, random_trimming: bool = True, focused_trim: bool = JUDGE_FOCUSED_TRIM_DEFAULT, focused_fps: int = DEFAULT_FOCUSED_JUDGE_FPS, side_by_side: bool = JUDGE_SIDE_BY_SIDE_DEFAULT, save_sbs_frames: bool = SAVE_SBS_FRAMES_DEFAULT, judge_model_name: str = DEFAULT_JUDGE_MODEL) -> tuple[bool, dict]:
     """
     Double-check differences using trimmed videos ("The Judge").
     Returns (is_verified, judge_logs_dict).
@@ -498,6 +643,9 @@ def verify_differences(video1_path: Path, video2_path: Path, differences: list, 
         "mode": mode_str,
         "fps": current_fps,
         "verified": None,
+        "difference_exists": None,
+        "is_ab_test": None,
+        "ab_test_explanation": None,
         "reasoning": None,
         "raw_response": None
     }
@@ -511,8 +659,9 @@ def verify_differences(video1_path: Path, video2_path: Path, differences: list, 
         try:
             (start1, end1), (start2, end2) = focused_ranges
             # Add 5 seconds buffer
-            trim1 = trim_video_segment(video1_path, start1 - 5, end1 + 5)
-            trim2 = trim_video_segment(video2_path, start2 - 5, end2 + 5)
+            seconds_buffer = 0
+            trim1 = trim_video_segment(video1_path, start1 - seconds_buffer, end1 + seconds_buffer)
+            trim2 = trim_video_segment(video2_path, start2 - seconds_buffer, end2 + seconds_buffer)
             judge_logs["focused_ranges"] = {"v1": [start1, end1], "v2": [start2, end2]}
             
             # Log exact filenames for user inspection (before deletion)
@@ -525,6 +674,15 @@ def verify_differences(video1_path: Path, video2_path: Path, differences: list, 
                 if sbs_video:
                     judge_logs["sbs_video"] = sbs_video.name
                     print(f"   👯 Side-by-Side Video (temp): {sbs_video.name}")
+                    
+                    if save_sbs_frames:
+                        app_name = video1_path.parent.name
+                        timestamp_str = datetime.now().strftime('%Y%m%d_%H%M%S')
+                        frames_dir = BASE_DIR / f"{app_name}_screenshots_sbs_{timestamp_str}"
+                        print(f"   📸 Extracting frames to: {frames_dir.name}")
+                        extract_frames_from_video(sbs_video, frames_dir, fps=3) # Hardcoded fps=3 as requested
+                        judge_logs["frames_dir"] = frames_dir.name
+                        
                 else:
                     logging.warning("Side-by-side failed, falling back to separate videos")
                     side_by_side = False # Disable for this run
@@ -602,59 +760,151 @@ def verify_differences(video1_path: Path, video2_path: Path, differences: list, 
             )
         ]
 
-    # 4. Call Gemini
+    # 4. Call Gemini with retry logic for 429 errors
     client = get_client()
-    try:
-        with _MODEL_CALL_SEM:
-            response = client.models.generate_content(
-                model="gemini-2.5-pro",
-                contents=contents,
-                config=types.GenerateContentConfig(
-                    temperature=0.0,
-                    response_mime_type="application/json"
+    last_error = None
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            with _MODEL_CALL_SEM:
+                response = client.models.generate_content(
+                    model=judge_model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(
+                        temperature=0.0,
+                        response_mime_type="application/json"
+                    )
                 )
+            
+            result = json.loads(response.text)
+            difference_exists = result.get("verified", True)  # Is the difference real?
+            judge_reasoning = result.get("reasoning", "")
+            
+            # Log the new per-difference analysis if available (multi-difference mode)
+            per_diff_analysis = result.get("per_difference_analysis", [])
+            verified_count = result.get("verified_count", None)
+            total_count = result.get("total_count", None)
+            
+            judge_logs["difference_exists"] = difference_exists
+            judge_logs["judge_reasoning"] = judge_reasoning
+            judge_logs["judge_raw_response"] = result
+            
+            # Log per-difference analysis details
+            if per_diff_analysis:
+                judge_logs["per_difference_analysis"] = per_diff_analysis
+                judge_logs["verified_count"] = verified_count
+                judge_logs["total_count"] = total_count
+                
+                print(f"\n   📊 Per-Difference Analysis ({verified_count}/{total_count} verified):")
+                for diff_result in per_diff_analysis:
+                    idx = diff_result.get("difference_index", "?")
+                    is_real = diff_result.get("is_real", False)
+                    summary = diff_result.get("description_summary", "")[:50]
+                    status = "✅ REAL" if is_real else "❌ HALLUCINATION"
+                    print(f"      {idx}. {status}: {summary}...")
+            
+            # Print Stage 1 result
+            print(f"\n   🧑‍⚖️ Judge Verdict: {'CONFIRMED' if difference_exists else 'REJECTED (Hallucination)'}")
+            print(f"   📝 Reasoning: {judge_reasoning[:200]}..." if len(judge_reasoning) > 200 else f"   📝 Reasoning: {judge_reasoning}")
+            
+            # Stage 2: A/B Test Classifier - ONLY for side-by-side mode (single difference)
+            # For multiple differences, we skip A/B classification and trust the judge
+            used_sbs_mode = use_focused_trim and side_by_side and sbs_video is not None
+            
+            if difference_exists and used_sbs_mode:
+                # Side-by-side mode: run A/B classifier
+                ab_result = classify_ab_test(differences, judge_reasoning, judge_model_name)
+                is_ab_test = ab_result.get("is_ab_test", True)
+                ab_test_reasoning = ab_result.get("reasoning", "")
+                
+                judge_logs["is_ab_test"] = is_ab_test
+                judge_logs["ab_test_reasoning"] = ab_test_reasoning
+                judge_logs["ab_classifier_raw"] = ab_result
+                
+                # Final verdict: difference counts only if it's both real AND an A/B test
+                is_verified = is_ab_test
+                
+                if is_ab_test:
+                    verdict_str = "✅ CONFIRMED (Real A/B Test)"
+                else:
+                    verdict_str = "❌ REJECTED (Not A/B Test - user data/system noise)"
+            elif difference_exists:
+                # Multiple differences (no SBS): trust judge verdict directly
+                is_verified = True
+                judge_logs["is_ab_test"] = None
+                judge_logs["ab_test_reasoning"] = "Skipped - multiple differences, no SBS mode"
+                verdict_str = "✅ CONFIRMED (Multiple differences)"
+            else:
+                # Difference was hallucination - not verified
+                is_verified = False
+                judge_logs["is_ab_test"] = None
+                judge_logs["ab_test_reasoning"] = "Skipped - difference was not confirmed"
+                verdict_str = "❌ REJECTED (Hallucination)"
+            
+            judge_logs["verified"] = is_verified
+            
+            print(f"\n   🏁 FINAL VERDICT: {verdict_str}")
+            
+            # Cleanup temporary files before returning
+            _cleanup_temp_files(use_focused_trim, random_trimming, trim1, trim2, sbs_video, video1_path, video2_path)
+            
+            logging.info(
+                "Judge verification finished in %.2f seconds for %s vs %s",
+                time.time() - start_time,
+                video1_path.name,
+                video2_path.name,
             )
-        result = json.loads(response.text)
-        is_verified = result.get("verified", True) # Default to true if unsure
-        
-        judge_logs["verified"] = is_verified
-        judge_logs["reasoning"] = result.get("reasoning")
-        judge_logs["raw_response"] = result
-        
-        print(f"   🧑‍⚖️ Verdict: {'CONFIRMED' if is_verified else 'REJECTED (Hallucination)'}")
-        print(f"   📝 Reasoning: {result.get('reasoning')}")
-        return is_verified, judge_logs
+            
+            return is_verified, judge_logs
 
-    except Exception as e:
-        print(f"   ⚠️ Judge error: {e}")
-        judge_logs["error"] = str(e)
-        return True, judge_logs # Fallback
-    finally:
-        # Only delete if we created temporary files
-        # focused trim ALWAYS creates temps. random trim creates temps.
-        # standard non-trim uses originals.
-        
-        # Helper to safely delete
-        def safe_del(p):
-            if p and p.exists():
-                try:
-                    os.remove(p)
-                except OSError:
-                    pass
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+            
+            # Check if this is a rate limit error and we have retries left
+            if is_rate_limit_error(e) and attempt < MAX_RETRIES - 1:
+                retry_delay = parse_retry_delay(error_str)
+                print(f"   ⏳ Rate limited (429). Waiting {retry_delay}s before retry {attempt + 2}/{MAX_RETRIES}...")
+                judge_logs[f"retry_{attempt + 1}_error"] = error_str
+                time.sleep(retry_delay)
+                continue
+            else:
+                # Non-retryable error or max retries exceeded
+                break
+    
+    # All retries failed or non-retryable error
+    print(f"   ⚠️ Judge error after {MAX_RETRIES} attempts: {last_error}")
+    judge_logs["error"] = str(last_error)
+    judge_logs["retries_exhausted"] = True
+    
+    # Cleanup temporary files before returning
+    _cleanup_temp_files(use_focused_trim, random_trimming, trim1, trim2, sbs_video, video1_path, video2_path)
+    
+    logging.info(
+        "Judge verification finished in %.2f seconds for %s vs %s",
+        time.time() - start_time,
+        video1_path.name,
+        video2_path.name,
+    )
+    
+    return True, judge_logs  # Fallback to trusting original result
 
-        if (use_focused_trim or random_trimming):
-            if trim1 and trim1 != video1_path: safe_del(trim1)
-            if trim2 and trim2 != video2_path: safe_del(trim2)
-            if sbs_video: safe_del(sbs_video)
-        
-        logging.info(
-            "Judge verification finished in %.2f seconds for %s vs %s",
-            time.time() - start_time,
-            video1_path.name,
-            video2_path.name,
-        )
 
-def compare_videos(video1_path: Path, video2_path: Path, prompt_text: str = COMPARISON_PROMPT, fps: int = DEFAULT_ANALYSIS_FPS, judge_random_trimming: bool = JUDGE_RANDOM_TRIMMING_DEFAULT, judge_focused_trim: bool = JUDGE_FOCUSED_TRIM_DEFAULT, judge_focused_fps: int = DEFAULT_FOCUSED_JUDGE_FPS, side_by_side: bool = JUDGE_SIDE_BY_SIDE_DEFAULT) -> dict:
+def _cleanup_temp_files(use_focused_trim, random_trimming, trim1, trim2, sbs_video, video1_path, video2_path):
+    """Helper to clean up temporary trimmed video files."""
+    def safe_del(p):
+        if p and p.exists():
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+    if (use_focused_trim or random_trimming):
+        if trim1 and trim1 != video1_path: safe_del(trim1)
+        if trim2 and trim2 != video2_path: safe_del(trim2)
+        if sbs_video: safe_del(sbs_video)
+
+def compare_videos(video1_path: Path, video2_path: Path, prompt_text: str = COMPARISON_PROMPT, fps: int = DEFAULT_ANALYSIS_FPS, judge_random_trimming: bool = JUDGE_RANDOM_TRIMMING_DEFAULT, judge_focused_trim: bool = JUDGE_FOCUSED_TRIM_DEFAULT, judge_focused_fps: int = DEFAULT_FOCUSED_JUDGE_FPS, side_by_side: bool = JUDGE_SIDE_BY_SIDE_DEFAULT, save_sbs_frames: bool = SAVE_SBS_FRAMES_DEFAULT, model_name: str = DEFAULT_MODEL, judge_model_name: str = DEFAULT_JUDGE_MODEL) -> dict:
     """Compare two videos using Gemini with custom FPS."""
     start_time = time.time()
     print(f"\n🔍 Comparing: {video1_path.name} vs {video2_path.name}")
@@ -665,7 +915,7 @@ def compare_videos(video1_path: Path, video2_path: Path, prompt_text: str = COMP
     video1_file = get_or_upload_video_cached(video1_path)
     video2_file = get_or_upload_video_cached(video2_path)
     
-    print(f"🤖 Analyzing with Gemini 2.5 Pro (FPS={fps})...")
+    print(f"🤖 Analyzing with {model_name} (FPS={fps})...")
     
     full_prompt_text = prompt_text
     
@@ -689,29 +939,52 @@ def compare_videos(video1_path: Path, video2_path: Path, prompt_text: str = COMP
         )
     ]
     
-    # Generate content
-    try:
-        with _MODEL_CALL_SEM:
-            response = client.models.generate_content(
-                model="gemini-2.5-pro",
-                contents=contents,
-                config=types.GenerateContentConfig(temperature=0.0)
-            )
-        response_text = response.text.strip()
-        
-        print(f"📋 Raw Response:\n{response_text}\n")
-        
-        # Parse JSON
-        json_start = response_text.find('{')
-        json_end = response_text.rfind('}') + 1
-        
-        if json_start != -1 and json_end > json_start:
-            result = json.loads(response_text[json_start:json_end])
-        else:
-            result = {"same_group": None, "differences": [], "error": "Could not parse JSON", "raw": response_text}
+    # Generate content with retry logic for 429 errors
+    result = None
+    last_error = None
+    
+    for attempt in range(MAX_RETRIES):
+        try:
+            with _MODEL_CALL_SEM:
+                response = client.models.generate_content(
+                    model=model_name,
+                    contents=contents,
+                    config=types.GenerateContentConfig(temperature=0.0)
+                )
+            response_text = response.text.strip()
             
-    except Exception as e:
-        result = {"same_group": None, "differences": [], "error": str(e)}
+            print(f"📋 Raw Response:\n{response_text}\n")
+            
+            # Parse JSON
+            json_start = response_text.find('{')
+            json_end = response_text.rfind('}') + 1
+            
+            if json_start != -1 and json_end > json_start:
+                result = json.loads(response_text[json_start:json_end])
+            else:
+                result = {"same_group": None, "differences": [], "error": "Could not parse JSON", "raw": response_text}
+            
+            # Success - break out of retry loop
+            break
+                
+        except Exception as e:
+            last_error = e
+            error_str = str(e)
+            
+            # Check if this is a rate limit error and we have retries left
+            if is_rate_limit_error(e) and attempt < MAX_RETRIES - 1:
+                retry_delay = parse_retry_delay(error_str)
+                print(f"⏳ Initial comparison rate limited (429). Waiting {retry_delay}s before retry {attempt + 2}/{MAX_RETRIES}...")
+                time.sleep(retry_delay)
+                continue
+            else:
+                # Non-retryable error or max retries exceeded
+                result = {"same_group": None, "differences": [], "error": error_str}
+                break
+    
+    # If we exhausted all retries without success
+    if result is None:
+        result = {"same_group": None, "differences": [], "error": f"Failed after {MAX_RETRIES} retries: {last_error}"}
 
     # === DOUBLE CHECK / JUDGE MECHANISM ===
     if DOUBLE_CHECK_ENABLED and result.get("same_group") is False:
@@ -722,7 +995,9 @@ def compare_videos(video1_path: Path, video2_path: Path, prompt_text: str = COMP
             random_trimming=judge_random_trimming,
             focused_trim=judge_focused_trim,
             focused_fps=judge_focused_fps,
-            side_by_side=side_by_side
+            side_by_side=side_by_side,
+            save_sbs_frames=save_sbs_frames,
+            judge_model_name=judge_model_name
         )
         
         result["judge_logs"] = judge_logs
@@ -819,7 +1094,10 @@ def cmd_compare(args):
                             judge_random_trimming=args.judge_trim,
                             judge_focused_trim=args.focused_trim,
                             judge_focused_fps=args.focused_fps,
-                            side_by_side=args.side_by_side)
+                            side_by_side=args.side_by_side,
+                            save_sbs_frames=args.save_sbs_frames,
+                            model_name=args.model,
+                            judge_model_name=args.judge_model)
     print_result(result)
     
     output_file = args.output or f"comparison_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
@@ -847,7 +1125,10 @@ def cmd_compare_all(args):
                                 judge_random_trimming=args.judge_trim,
                                 judge_focused_trim=args.focused_trim,
                                 judge_focused_fps=args.focused_fps,
-                                side_by_side=args.side_by_side)
+                                side_by_side=args.side_by_side,
+                                save_sbs_frames=args.save_sbs_frames,
+                                model_name=args.model,
+                                judge_model_name=args.judge_model)
         results.append(result)
         print_result(result)
         
@@ -888,7 +1169,9 @@ def main():
     comp_p.add_argument("--no-focused-trim", action="store_false", dest="focused_trim", default=True, help="Disable focused trimming for single difference")
     comp_p.add_argument("--focused-fps", type=int, default=DEFAULT_FOCUSED_JUDGE_FPS, help="FPS for focused judge analysis")
     comp_p.add_argument("--no-side-by-side", action="store_false", dest="side_by_side", default=True, help="Disable side-by-side video for focused judge")
-
+    comp_p.add_argument("--save-sbs-frames", action="store_true", dest="save_sbs_frames", default=False, help="Enable saving frames from SBS video")
+    comp_p.add_argument("--model", type=str, default=DEFAULT_MODEL, help=f"Gemini model for initial analysis (default: {DEFAULT_MODEL})")
+    comp_p.add_argument("--judge-model", type=str, default=DEFAULT_JUDGE_MODEL, help=f"Gemini model for judge verification (default: {DEFAULT_JUDGE_MODEL})")
     
     all_p = subparsers.add_parser("compare-all")
     all_p.add_argument("--folder", "-f", required=True)
@@ -898,6 +1181,9 @@ def main():
     all_p.add_argument("--no-focused-trim", action="store_false", dest="focused_trim", default=True, help="Disable focused trimming for single difference")
     all_p.add_argument("--focused-fps", type=int, default=DEFAULT_FOCUSED_JUDGE_FPS, help="FPS for focused judge analysis")
     all_p.add_argument("--no-side-by-side", action="store_false", dest="side_by_side", default=True, help="Disable side-by-side video for focused judge")
+    all_p.add_argument("--save-sbs-frames", action="store_true", dest="save_sbs_frames", default=False, help="Enable saving frames from SBS video")
+    all_p.add_argument("--model", type=str, default=DEFAULT_MODEL, help=f"Gemini model for initial analysis (default: {DEFAULT_MODEL})")
+    all_p.add_argument("--judge-model", type=str, default=DEFAULT_JUDGE_MODEL, help=f"Gemini model for judge verification (default: {DEFAULT_JUDGE_MODEL})")
 
     args = parser.parse_args()
     if args.command == "list":

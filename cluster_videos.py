@@ -22,7 +22,9 @@ try:
         get_videos_in_folder,
         BASE_DIR,
         DEFAULT_ANALYSIS_FPS,
-        DEFAULT_FOCUSED_JUDGE_FPS
+        DEFAULT_FOCUSED_JUDGE_FPS,
+        DEFAULT_MODEL,
+        DEFAULT_JUDGE_MODEL
     )
 except ImportError:
     print("❌ Error: compare_two_videos.py not found or not importable.")
@@ -61,7 +63,7 @@ def prune_none(obj):
     return obj
 
 
-def perform_clustering(folder_name: str, output_file: Optional[str] = None, max_workers: int = 4, fps: int = DEFAULT_ANALYSIS_FPS, judge_random_trimming: bool = True, judge_focused_trim: bool = True, judge_focused_fps: int = DEFAULT_FOCUSED_JUDGE_FPS, side_by_side: bool = True):
+def perform_clustering(folder_name: str, output_file: Optional[str] = None, max_workers: int = 4, fps: int = DEFAULT_ANALYSIS_FPS, judge_random_trimming: bool = True, judge_focused_trim: bool = True, judge_focused_fps: int = DEFAULT_FOCUSED_JUDGE_FPS, side_by_side: bool = True, save_sbs_frames: bool = False, model_name: str = DEFAULT_MODEL, judge_model_name: str = DEFAULT_JUDGE_MODEL):
     folder = BASE_DIR / folder_name
     if not folder.exists():
         print(f"❌ Folder not found: {folder_name}")
@@ -97,7 +99,7 @@ def perform_clustering(folder_name: str, output_file: Optional[str] = None, max_
             candidates = remaining
             remaining = []
 
-            futures = {executor.submit(compare_videos, representative, candidate, fps=fps, judge_random_trimming=judge_random_trimming, judge_focused_trim=judge_focused_trim, judge_focused_fps=judge_focused_fps, side_by_side=side_by_side): candidate for candidate in candidates}
+            futures = {executor.submit(compare_videos, representative, candidate, fps=fps, judge_random_trimming=judge_random_trimming, judge_focused_trim=judge_focused_trim, judge_focused_fps=judge_focused_fps, side_by_side=side_by_side, save_sbs_frames=save_sbs_frames, model_name=model_name, judge_model_name=judge_model_name): candidate for candidate in candidates}
 
             for future in as_completed(futures):
                 candidate = futures[future]
@@ -170,9 +172,12 @@ def main():
     parser.add_argument("--no-focused-trim", action="store_false", dest="focused_trim", default=True, help="Disable focused trimming for single difference")
     parser.add_argument("--focused-fps", type=int, default=DEFAULT_FOCUSED_JUDGE_FPS, help="FPS for focused judge analysis")
     parser.add_argument("--no-side-by-side", action="store_false", dest="side_by_side", default=True, help="Disable side-by-side video for focused judge")
+    parser.add_argument("--save-sbs-frames", action="store_true", dest="save_sbs_frames", default=False, help="Enable saving frames from SBS video")
+    parser.add_argument("--model", type=str, default=DEFAULT_MODEL, help=f"Gemini model for initial analysis (default: {DEFAULT_MODEL})")
+    parser.add_argument("--judge-model", type=str, default=DEFAULT_JUDGE_MODEL, help=f"Gemini model for judge verification (default: {DEFAULT_JUDGE_MODEL})")
     
     args = parser.parse_args()
-    perform_clustering(args.folder, args.output, args.max_workers, fps=args.fps, judge_random_trimming=args.judge_trim, judge_focused_trim=args.focused_trim, judge_focused_fps=args.focused_fps, side_by_side=args.side_by_side)
+    perform_clustering(args.folder, args.output, args.max_workers, fps=args.fps, judge_random_trimming=args.judge_trim, judge_focused_trim=args.focused_trim, judge_focused_fps=args.focused_fps, side_by_side=args.side_by_side, save_sbs_frames=args.save_sbs_frames, model_name=args.model, judge_model_name=args.judge_model)
 
 
 if __name__ == "__main__":
